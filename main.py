@@ -3,6 +3,7 @@ from pprint import pprint
 import time
 from datetime import datetime
 from datetime import timedelta
+import requests
 import sys
 
 
@@ -14,13 +15,7 @@ host, port = sys.argv[1], int(sys.argv[2])
 max_inactive_time = timedelta(hours=1)
 update_interval_seconds = 10
 
-client = aria2p.Client(
-        host=host,
-        port=port,
-        secret="",)
-aria2 = aria2p.API(client)
-
-def move_task_end(download):
+def move_task_end(aria2, client, download):
 
     # Pause the task
     while True:
@@ -64,7 +59,7 @@ def move_task_end(download):
     while True:
         print('trying to move %s the the end' % download.gid)
 
-        last_waiting_gid = None
+        last_waiting = None
         for d1 in aria2.get_downloads():
             if d1.status == 'waiting':
                 last_waiting = d1
@@ -72,56 +67,72 @@ def move_task_end(download):
                 print('while moving task %s to the end, the task becomes active' % download.gid)
                 break
 
-        if last_waiting.gid == download.gid:
+        if last_waiting and last_waiting.gid == download.gid:
             print('moved task %s to the end of the queue' % download.gid)
             break
 
         client.change_position(download.gid, 1, 'POS_END')
 
-# main loop
-tasks_active = {}
+def main_loop(host, port, update_interval_seconds, max_inactive_time):
+    client = aria2p.Client(
+            host=host,
+            port=port,
+            secret="",)
+    aria2 = aria2p.API(client)
+
+    # main loop
+    tasks_active = {}
+    while True:
+        now = datetime.now()
+        tasks_active_new = {}
+        downloads = aria2.get_downloads()
+
+        # Report status
+        stats = {'waiting': 0, 'active': 0, 'seeding': 0, 'complete': 0}
+        for download in downloads:
+            if download.status == 'waiting':
+                stats['waiting'] += 1
+            elif download.status == 'complete':
+                if not download.followed_by:
+                    stats['complete'] += 1
+            elif download.status == 'active':
+                if download.completed_length >= download.total_length and download.total_length > 0:
+                    stats['seeding'] += 1
+                else:
+                    stats['active'] += 1
+
+                    # update 'added_time'
+                    if download.gid in tasks_active:
+                        tasks_active_new[download.gid] = {'raw': download, 'added_time': tasks_active[download.gid]['added_time'], 'last_download_active_time': tasks_active[download.gid]['last_download_active_time']}
+                    else:
+                        tasks_active_new[download.gid] = {'raw': download, 'added_time': now, 'last_download_active_time': now}
+
+                    # update 'download_active_time'
+                    if download.download_speed > 0:
+                        tasks_active_new[download.gid]['last_download_active_time'] = now
+        tasks_active = tasks_active_new
+
+        # Move 'inactive downloading tasks' to the end of the queue
+        for gid in tasks_active:
+            t = tasks_active[gid]
+            inactive_time = now - t['last_download_active_time']
+            print("Task %s, Inactive time: %s" % (gid, inactive_time))
+            if inactive_time > max_inactive_time:
+                print("Task %s, move to the end of the queue" % gid)
+                # Only move one task at time
+                move_task_end(aria2, client, tasks_active[gid]['raw'])
+                break
+
+        # Make sure no task is paused
+        print(client.call('aria2.unpauseAll'))
+        
+        print('Active: %d, Waiting: %d, Seeding %d, Complete %d' % (stats['active'], stats['waiting'], stats['seeding'], stats['complete']))
+        # wait a moment
+        time.sleep(update_interval_seconds)
+
 while True:
-    now = datetime.now()
-    tasks_active_new = {}
-    downloads = aria2.get_downloads()
-
-    # Report status
-    waiting = 0
-    active = 0
-    for download in downloads:
-        #  print(dir(download))
-        if download.status not in ('waiting', 'paused', 'active'):
-            continue
-        if download.status == 'waiting':
-            waiting += 1
-        elif download.status == 'active':
-            active += 1
-
-            # update 'added_time'
-            if download.gid in tasks_active:
-                tasks_active_new[download.gid] = {'raw': download, 'added_time': tasks_active[download.gid]['added_time'], 'last_download_active_time': tasks_active[download.gid]['last_download_active_time']}
-            else:
-                tasks_active_new[download.gid] = {'raw': download, 'added_time': now, 'last_download_active_time': now}
-
-            # update 'download_active_time'
-            if download.download_speed > 0:
-                tasks_active_new[download.gid]['last_download_active_time'] = now
-    tasks_active = tasks_active_new
-
-    # Move 'inactive downloading tasks' to the end of the queue
-    for gid in tasks_active:
-        t = tasks_active[gid]
-        inactive_time = now - t['last_download_active_time']
-        print("Task %s, Inactive time: %s" % (gid, inactive_time))
-        if inactive_time > max_inactive_time:
-            print("Task %s, move to the end of the queue" % gid)
-            # Only move one task at time
-            move_task_end(tasks_active[gid]['raw'])
-            break
-
-    # Make sure no task is paused
-    print(client.call('aria2.unpauseAll'))
-    
-    print('Active: %d, Waiting: %d' % (active, waiting,))
-    # wait a moment
-    time.sleep(update_interval_seconds)
+    try:
+        main_loop(host, port, update_interval_seconds, max_inactive_time)
+    except requests.exceptions.ConnectionError as e:
+        print("Networking down, retrying...")
+        time.sleep(1)
